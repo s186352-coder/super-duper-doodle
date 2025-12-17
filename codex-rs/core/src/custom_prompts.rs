@@ -1,0 +1,95 @@
+use codex_protocol::custom_prompts::CustomPrompt;
+use std::collections::HashSet;
+use std::path::Path;
+use std::path::PathBuf;
+
+/// Return the default prompts directory: `$CODEX_HOME/prompts`.
+/// If `CODEX_HOME` cannot be resolved, returns `None`.
+pub fn default_prompts_dir() -> Option<PathBuf> {
+    crate::config::find_codex_home()
+        .ok()
+        .map(|home| home.join("prompts"))
+}
+
+/// Discover prompt files in the given directory, returning entries sorted by name.
+/// Non-files are ignored. If the directory does not exist or cannot be read, returns empty.
+pub fn discover_prompts_in(dir: &Path) -> Vec<CustomPrompt> {
+    discover_prompts_in_excluding(dir, &HashSet::new())
+}
+
+/// Discover prompt files in the given directory, excluding any with names in `exclude`.
+/// Returns entries sorted by name. Non-files are ignored. Missing/unreadable dir yields empty.
+pub fn discover_prompts_in_excluding(dir: &Path, exclude: &HashSet<String>) -> Vec<CustomPrompt> {
+    let mut out: Vec<CustomPrompt> = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+            // Only include Markdown files with a .md extension.
+            let is_md = path
+                .extension()
+                .and_then(|s| s.to_str())
+                .map(|ext| ext.eq_ignore_ascii_case("md"))
+                .unwrap_or(false);
+            if !is_md {
+                continue;
+            }
+            let Some(name) = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .map(|s| s.to_string())
+            else {
+                continue;
+            };
+            if exclude.contains(&name) {
+                continue;
+            }
+            let content = std::fs::read_to_string(&path).unwrap_or_default();
+            out.push(CustomPrompt { name, content });
+        }
+        out.sort_by(|a, b| a.name.cmp(&b.name));
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use tempfile::tempdir;
+
+    #[test]
+    fn empty_when_dir_missing() {
+        let tmp = tempdir().expect("create TempDir");
+        let missing = tmp.path().join("nope");
+        let found = discover_prompts_in(&missing);
+        assert!(found.is_empty());
+    }
+
+    #[test]
+    fn discovers_and_sorts_files() {
+        let tmp = tempdir().expect("create TempDir");
+        let dir = tmp.path();
+        fs::write(dir.join("b.md"), b"b").unwrap();
+        fs::write(dir.join("a.md"), b"a").unwrap();
+        fs::create_dir(dir.join("subdir")).unwrap();
+        let found = discover_prompts_in(dir);
+        let names: Vec<String> = found.into_iter().map(|e| e.name).collect();
+        assert_eq!(names, vec!["a", "b"]);
+    }
+
+    #[test]
+    fn excludes_builtins() {
+        let tmp = tempdir().expect("create TempDir");
+        let dir = tmp.path();
+        fs::write(dir.join("init.md"), b"ignored").unwrap();
+        fs::write(dir.join("foo.md"), b"ok").unwrap();
+        let mut exclude = HashSet::new();
+        exclude.insert("init".to_string());
+        let found = discover_prompts_in_excluding(dir, &exclude);
+        let names: Vec<String> = found.into_iter().map(|e| e.name).collect();
+        assert_eq!(names, vec!["foo"]);
+    }
+}
