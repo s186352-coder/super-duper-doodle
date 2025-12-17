@@ -1,0 +1,19 @@
+# Display help
+help:
+    just -l
+
+# `codex`
+codex *args:
+    cargo run --bin codex -- {{args}}
+
+# `codex exec`
+exec *args:
+    cargo run --bin codex -- exec {{args}}
+
+# `codex tui`
+tui *args:
+    cargo run --bin codex -- tui {{args}}
+
+# format code
+fmt:
+    cargo fmt -- --config imports_granularity=Item
