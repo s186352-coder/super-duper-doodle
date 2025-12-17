@@ -1,0 +1,58 @@
+use clap::Parser;
+use codex_common::ApprovalModeCliArg;
+use codex_common::CliConfigOverrides;
+use codex_common::SandboxPermissionOption;
+use std::path::PathBuf;
+use uuid::Uuid;
+
+/// Interactive TUI for chatting with Codex.
+///
+/// If a `--session` UUID is provided, resumes the existing session.
+#[derive(Parser, Debug)]
+#[command(version)]
+pub struct Cli {
+    /// Resume a previous session by its UUID.
+    #[arg(long, value_name = "SESSION_ID")]
+    pub session: Option<Uuid>,
+
+    /// Optional user prompt to start the session.
+    pub prompt: Option<String>,
+
+    /// Optional image(s) to attach to the initial prompt.
+    #[arg(long = "image", short = 'i', value_name = "FILE", value_delimiter = ',', num_args = 1..)]
+    pub images: Vec<PathBuf>,
+
+    /// Model the agent should use.
+    #[arg(long, short = 'm')]
+    pub model: Option<String>,
+
+    /// Configuration profile from config.toml to specify default options.
+    #[arg(long = "profile", short = 'p')]
+    pub config_profile: Option<String>,
+
+    /// Configure when the model requires human approval before executing a command.
+    #[arg(long = "ask-for-approval", short = 'a')]
+    pub approval_policy: Option<ApprovalModeCliArg>,
+
+    /// Convenience alias for low-friction sandboxed automatic execution (-a on-failure, network-disabled sandbox that can write to cwd and TMPDIR)
+    #[arg(long = "full-auto", default_value_t = false)]
+    pub full_auto: bool,
+
+    #[clap(flatten)]
+    pub sandbox: SandboxPermissionOption,
+
+    /// Tell the agent to use the specified directory as its working root.
+    #[clap(long = "cd", short = 'C', value_name = "DIR")]
+    pub cwd: Option<PathBuf>,
+
+    /// Allow running Codex outside a Git repository.
+    #[arg(long = "skip-git-repo-check", default_value_t = false)]
+    pub skip_git_repo_check: bool,
+
+    /// Optional path where debug logs will be written (overrides default log file).
+    #[arg(long = "debug-log", value_name = "FILE")]
+    pub debug_log: Option<PathBuf>,
+
+    #[clap(skip)]
+    pub config_overrides: CliConfigOverrides,
+}
