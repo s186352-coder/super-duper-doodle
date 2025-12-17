@@ -1,0 +1,12 @@
+---
+source: tui/src/chatwidget/tests.rs
+expression: terminal.backend()
+---
+"                                                                                "
+"▌Allow command?                                                                 "
+"▌> 1. Yes                                                                       "
+"▌  2. Always                                                                    "
+"▌  3. No, provide feedback                                                      "
+"▌                                                                               "
+"▌ Approve and run the command                                                   "
+"                                                                                "
