@@ -1,0 +1,749 @@
+use crate::app_event::AppEvent;
+use crate::app_event_sender::AppEventSender;
+use crate::chatwidget::ChatWidget;
+use crate::danger_warning_screen::DangerWarningOutcome;
+use crate::danger_warning_screen::DangerWarningScreen;
+use crate::file_search::FileSearchManager;
+use crate::get_git_diff::get_git_diff;
+use crate::git_warning_screen::GitWarningOutcome;
+use crate::git_warning_screen::GitWarningScreen;
+use crate::slash_command::SlashCommand;
+use crate::tui;
+use codex_core::config::Config;
+use codex_core::protocol::Event;
+use codex_core::protocol::EventMsg;
+use codex_core::protocol::Op;
+use color_eyre::eyre::Result;
+use crossterm::SynchronizedUpdate;
+use crossterm::event::KeyCode;
+use crossterm::event::KeyEvent;
+use crossterm::event::KeyEventKind;
+use crossterm::execute as ct_execute;
+use crossterm::terminal::EnterAlternateScreen;
+use crossterm::terminal::LeaveAlternateScreen;
+use crossterm::terminal::supports_keyboard_enhancement;
+use ratatui::backend::Backend;
+use ratatui::layout::Offset;
+use ratatui::layout::Rect;
+use ratatui::text::Line;
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
+use std::sync::mpsc::Receiver;
+use std::sync::mpsc::channel;
+use std::thread;
+use std::time::Duration;
+
+/// Time window for debouncing redraw requests.
+const REDRAW_DEBOUNCE: Duration = Duration::from_millis(10);
+
+/// Top-level application state: which full-screen view is currently active.
+#[allow(clippy::large_enum_variant)]
+enum AppState<'a> {
+    /// The main chat UI is visible.
+    Chat {
+        /// Boxed to avoid a large enum variant and reduce the overall size of
+        /// `AppState`.
+        widget: Box<ChatWidget<'a>>,
+    },
+    /// The start-up warning that recommends running codex inside a Git repo.
+    GitWarning { screen: GitWarningScreen },
+    /// Full‑screen warning when switching to the fully‑unsafe execution mode.
+    DangerWarning {
+        screen: DangerWarningScreen,
+        /// Retain the chat widget so background events can still be processed.
+        widget: Box<ChatWidget<'a>>,
+        pending_approval: codex_core::protocol::AskForApproval,
+        pending_sandbox: codex_core::protocol::SandboxPolicy,
+    },
+}
+
+/// Strip a single pair of surrounding quotes from the provided string if present.
+/// Supports straight and common curly quotes: '…', "…", ‘…’, “…”.
+pub(crate) struct App<'a> {
+    app_event_tx: AppEventSender,
+    app_event_rx: Receiver<AppEvent>,
+    app_state: AppState<'a>,
+
+    /// Config is stored here so we can recreate ChatWidgets as needed.
+    config: Config,
+
+    file_search: FileSearchManager,
+
+    /// True when a redraw has been scheduled but not yet executed.
+    pending_redraw: Arc<AtomicBool>,
+
+    pending_history_lines: Vec<Line<'static>>,
+
+    /// Stored parameters needed to instantiate the ChatWidget later, e.g.,
+    /// after dismissing the Git-repo warning.
+    chat_args: Option<ChatWidgetArgs>,
+
+    enhanced_keys_supported: bool,
+    /// One-shot flag to resync viewport and cursor after leaving the
+    /// alternate-screen Danger warning so the composer stays at the bottom.
+    fixup_viewport_after_danger: bool,
+    /// If set, defer opening the DangerWarning screen until after the next
+    /// redraw so any selection popups are cleared from the normal screen.
+    pending_show_danger: Option<(
+        codex_core::protocol::AskForApproval,
+        codex_core::protocol::SandboxPolicy,
+    )>,
+    last_bottom_pane_area: Option<Rect>,
+}
+
+/// Aggregate parameters needed to create a `ChatWidget`, as creation may be
+/// deferred until after the Git warning screen is dismissed.
+#[derive(Clone)]
+struct ChatWidgetArgs {
+    config: Config,
+    initial_prompt: Option<String>,
+    initial_images: Vec<PathBuf>,
+    enhanced_keys_supported: bool,
+    cli_flags_used: Vec<String>,
+    cli_model: Option<String>,
+}
+
+impl App<'_> {
+    /// Handle `/model <arg>` from the slash command dispatcher.
+    fn handle_model_command(&mut self, args: &str) {
+        let arg = args.trim();
+        if let AppState::Chat { widget } = &mut self.app_state {
+            let normalized = crate::command_utils::normalize_token(arg);
+            if !normalized.is_empty() {
+                widget.update_model_and_reconfigure(normalized);
+            }
+        }
+    }
+
+    fn handle_approvals_command(&mut self, args: &str) {
+        let arg = args.trim();
+        if let AppState::Chat { widget } = &mut self.app_state {
+            let normalized = crate::command_utils::normalize_token(arg);
+            if !normalized.is_empty() {
+                use crate::command_utils::parse_execution_mode_token;
+                if let Some((approval, sandbox)) = parse_execution_mode_token(&normalized) {
+                    if crate::command_utils::ExecutionPreset::from_policies(approval, &sandbox)
+                        == Some(crate::command_utils::ExecutionPreset::FullYolo)
+                    {
+                        // Defer opening the danger screen until after the next redraw so any
+                        // selection UI is cleared.
+                        self.pending_show_danger = Some((approval, sandbox));
+                        self.app_event_tx.send(AppEvent::RequestRedraw);
+                    } else {
+                        widget.update_execution_mode_and_reconfigure(approval, sandbox);
+                    }
+                } else {
+                    widget.add_diff_output(format!(
+                        "`/approvals {normalized}` — unrecognized execution mode"
+                    ));
+                }
+            }
+        }
+    }
+    pub(crate) fn new(
+        config: Config,
+        initial_prompt: Option<String>,
+        show_git_warning: bool,
+        initial_images: Vec<std::path::PathBuf>,
+        cli_flags_used: Vec<String>,
+        cli_model: Option<String>,
+    ) -> Self {
+        let (app_event_tx, app_event_rx) = channel();
+        let app_event_tx = AppEventSender::new(app_event_tx);
+        let pending_redraw = Arc::new(AtomicBool::new(false));
+
+        let enhanced_keys_supported = supports_keyboard_enhancement().unwrap_or(false);
+
+        // Spawn a dedicated thread for reading the crossterm event loop and
+        // re-publishing the events as AppEvents, as appropriate.
+        {
+            let app_event_tx = app_event_tx.clone();
+            std::thread::spawn(move || {
+                loop {
+                    // This timeout is necessary to avoid holding the event lock
+                    // that crossterm::event::read() acquires. In particular,
+                    // reading the cursor position (crossterm::cursor::position())
+                    // needs to acquire the event lock, and so will fail if it
+                    // can't acquire it within 2 sec. Resizing the terminal
+                    // crashes the app if the cursor position can't be read.
+                    if let Ok(true) = crossterm::event::poll(Duration::from_millis(100)) {
+                        if let Ok(event) = crossterm::event::read() {
+                            match event {
+                                crossterm::event::Event::Key(key_event) => {
+                                    app_event_tx.send(AppEvent::KeyEvent(key_event));
+                                }
+                                crossterm::event::Event::Resize(_, _) => {
+                                    app_event_tx.send(AppEvent::RequestRedraw);
+                                }
+                                crossterm::event::Event::Paste(pasted) => {
+                                    // Many terminals convert newlines to \r when
+                                    // pasting, e.g. [iTerm2][]. But [tui-textarea
+                                    // expects \n][tui-textarea]. This seems like a bug
+                                    // in tui-textarea IMO, but work around it for now.
+                                    // [tui-textarea]: https://github.com/rhysd/tui-textarea/blob/4d18622eeac13b309e0ff6a55a46ac6706da68cf/src/textarea.rs#L782-L783
+                                    // [iTerm2]: https://github.com/gnachman/iTerm2/blob/5d0c0d9f68523cbd0494dad5422998964a2ecd8d/sources/iTermPasteHelper.m#L206-L216
+                                    let pasted = pasted.replace("\r", "\n");
+                                    app_event_tx.send(AppEvent::Paste(pasted));
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+            });
+        }
+
+        let (app_state, chat_args) = if show_git_warning {
+            (
+                AppState::GitWarning {
+                    screen: GitWarningScreen::new(),
+                },
+                Some(ChatWidgetArgs {
+                    config: config.clone(),
+                    initial_prompt,
+                    initial_images,
+                    enhanced_keys_supported,
+                    cli_flags_used: cli_flags_used.clone(),
+                    cli_model: cli_model.clone(),
+                }),
+            )
+        } else {
+            let chat_widget = ChatWidget::new(
+                config.clone(),
+                app_event_tx.clone(),
+                initial_prompt,
+                initial_images,
+                enhanced_keys_supported,
+                cli_flags_used.clone(),
+                cli_model.clone(),
+            );
+            (
+                AppState::Chat {
+                    widget: Box::new(chat_widget),
+                },
+                None,
+            )
+        };
+
+        let file_search = FileSearchManager::new(config.cwd.clone(), app_event_tx.clone());
+        Self {
+            app_event_tx,
+            pending_history_lines: Vec::new(),
+            app_event_rx,
+            app_state,
+            config,
+            file_search,
+            pending_redraw,
+            chat_args,
+            enhanced_keys_supported,
+            fixup_viewport_after_danger: false,
+            pending_show_danger: None,
+            last_bottom_pane_area: None,
+        }
+    }
+
+    /// Clone of the internal event sender so external tasks (e.g. log bridge)
+    /// can inject `AppEvent`s.
+    pub fn event_sender(&self) -> AppEventSender {
+        self.app_event_tx.clone()
+    }
+
+    /// Schedule a redraw if one is not already pending.
+    #[allow(clippy::unwrap_used)]
+    fn schedule_redraw(&self) {
+        // Attempt to set the flag to `true`. If it was already `true`, another
+        // redraw is already pending so we can return early.
+        if self
+            .pending_redraw
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return;
+        }
+
+        let tx = self.app_event_tx.clone();
+        let pending_redraw = self.pending_redraw.clone();
+        thread::spawn(move || {
+            thread::sleep(REDRAW_DEBOUNCE);
+            tx.send(AppEvent::Redraw);
+            pending_redraw.store(false, Ordering::SeqCst);
+        });
+    }
+
+    pub(crate) fn run(&mut self, terminal: &mut tui::Tui) -> Result<()> {
+        // Insert an event to trigger the first render.
+        let app_event_tx = self.app_event_tx.clone();
+        app_event_tx.send(AppEvent::RequestRedraw);
+
+        while let Ok(event) = self.app_event_rx.recv() {
+            match event {
+                AppEvent::InsertHistory(lines) => {
+                    self.pending_history_lines.extend(lines);
+                    self.app_event_tx.send(AppEvent::RequestRedraw);
+                }
+                AppEvent::RequestRedraw => {
+                    self.schedule_redraw();
+                }
+                AppEvent::Redraw => {
+                    std::io::stdout().sync_update(|_| self.draw_next_frame(terminal))??;
+                    if let Some((approval, sandbox)) = self.pending_show_danger.take() {
+                        if let Some(area) = self.last_bottom_pane_area {
+                            use crossterm::cursor::MoveTo;
+                            use crossterm::queue;
+                            use crossterm::terminal::Clear;
+                            use crossterm::terminal::ClearType;
+                            use std::io::Write;
+                            for y in area.y..area.bottom() {
+                                let _ = queue!(
+                                    std::io::stdout(),
+                                    MoveTo(0, y),
+                                    Clear(ClearType::CurrentLine)
+                                );
+                            }
+                            let _ = std::io::stdout().flush();
+                        }
+                        if let AppState::Chat { widget } = std::mem::replace(
+                            &mut self.app_state,
+                            AppState::GitWarning {
+                                screen: GitWarningScreen::new(),
+                            },
+                        ) {
+                            let _ = ct_execute!(std::io::stdout(), EnterAlternateScreen);
+                            self.app_state = AppState::DangerWarning {
+                                screen: DangerWarningScreen::new(),
+                                widget,
+                                pending_approval: approval,
+                                pending_sandbox: sandbox,
+                            };
+                            self.app_event_tx.send(AppEvent::RequestRedraw);
+                        }
+                    }
+                }
+                AppEvent::KeyEvent(key_event) => {
+                    match key_event {
+                        KeyEvent {
+                            code: KeyCode::Char('c'),
+                            modifiers: crossterm::event::KeyModifiers::CONTROL,
+                            kind: KeyEventKind::Press,
+                            ..
+                        } => match &mut self.app_state {
+                            AppState::Chat { widget } => {
+                                widget.on_ctrl_c();
+                            }
+                            AppState::GitWarning { .. } => {}
+                            AppState::DangerWarning { .. } => {}
+                        },
+                        KeyEvent {
+                            code: KeyCode::Char('d'),
+                            modifiers: crossterm::event::KeyModifiers::CONTROL,
+                            kind: KeyEventKind::Press,
+                            ..
+                        } => match &mut self.app_state {
+                            AppState::Chat { widget } => {
+                                if widget.composer_is_empty() {
+                                    self.app_event_tx.send(AppEvent::ExitRequest);
+                                } else {
+                                    self.dispatch_key_event(key_event);
+                                }
+                            }
+                            AppState::GitWarning { .. } => {
+                                self.app_event_tx.send(AppEvent::ExitRequest);
+                            }
+                            AppState::DangerWarning { .. } => {}
+                        },
+                        KeyEvent {
+                            kind: KeyEventKind::Press | KeyEventKind::Repeat,
+                            ..
+                        } => {
+                            self.dispatch_key_event(key_event);
+                        }
+                        _ => {}
+                    };
+                }
+                AppEvent::Paste(text) => {
+                    self.dispatch_paste_event(text);
+                }
+                AppEvent::CodexEvent(event) => {
+                    self.dispatch_codex_event(event);
+                }
+                AppEvent::ExitRequest => {
+                    break;
+                }
+                AppEvent::SelectModel(model) => {
+                    if let AppState::Chat { widget } = &mut self.app_state {
+                        widget.update_model_and_reconfigure(model);
+                    }
+                }
+                AppEvent::SelectExecutionMode { approval, sandbox } => {
+                    // Intercept the dangerous preset with a full‑screen warning.
+                    if let AppState::Chat { widget: _ } = &self.app_state {
+                        if crate::command_utils::ExecutionPreset::from_policies(approval, &sandbox)
+                            == Some(crate::command_utils::ExecutionPreset::FullYolo)
+                        {
+                            // Defer opening the danger screen until after the next redraw so the
+                            // selection popup is closed and the normal screen is clean.
+                            self.pending_show_danger = Some((approval, sandbox));
+                            self.app_event_tx.send(AppEvent::RequestRedraw);
+                        } else if let AppState::Chat { widget } = std::mem::replace(
+                            &mut self.app_state,
+                            AppState::GitWarning {
+                                screen: GitWarningScreen::new(),
+                            },
+                        ) {
+                            // Restore chat state and apply immediately for safe presets.
+                            let mut w = widget;
+                            w.update_execution_mode_and_reconfigure(approval, sandbox);
+                            self.app_state = AppState::Chat { widget: w };
+                        }
+                    }
+                }
+                AppEvent::OpenModelSelector => {
+                    if let AppState::Chat { widget } = &mut self.app_state {
+                        widget.show_model_selector();
+                    }
+                }
+                AppEvent::OpenExecutionSelector => {
+                    if let AppState::Chat { widget } = &mut self.app_state {
+                        widget.show_execution_selector();
+                    }
+                }
+                AppEvent::CodexOp(op) => match &mut self.app_state {
+                    AppState::Chat { widget } => widget.submit_op(op),
+                    AppState::GitWarning { .. } => {}
+                    AppState::DangerWarning { widget, .. } => widget.submit_op(op),
+                },
+                AppEvent::LatestLog(line) => match &mut self.app_state {
+                    AppState::Chat { widget } => widget.update_latest_log(line),
+                    AppState::GitWarning { .. } => {}
+                    AppState::DangerWarning { widget, .. } => widget.update_latest_log(line),
+                },
+                AppEvent::DispatchCommand { cmd, args } => match (cmd, args.as_deref()) {
+                    (SlashCommand::New, _) => {
+                        let new_widget = Box::new(ChatWidget::new(
+                            self.config.clone(),
+                            self.app_event_tx.clone(),
+                            None,
+                            Vec::new(),
+                            self.enhanced_keys_supported,
+                            self.chat_args
+                                .as_ref()
+                                .map(|a| a.cli_flags_used.clone())
+                                .unwrap_or_default(),
+                            self.chat_args.as_ref().and_then(|a| a.cli_model.clone()),
+                        ));
+                        self.app_state = AppState::Chat { widget: new_widget };
+                        self.app_event_tx.send(AppEvent::RequestRedraw);
+                    }
+                    (SlashCommand::Compact, _) => {
+                        if let AppState::Chat { widget } = &mut self.app_state {
+                            widget.clear_token_usage();
+                            self.app_event_tx.send(AppEvent::CodexOp(Op::Compact));
+                        }
+                    }
+                    (SlashCommand::Quit, _) => {
+                        break;
+                    }
+                    (SlashCommand::Diff, _) => {
+                        let (is_git_repo, diff_text) = match get_git_diff() {
+                            Ok(v) => v,
+                            Err(e) => {
+                                let msg = format!("Failed to compute diff: {e}");
+                                if let AppState::Chat { widget } = &mut self.app_state {
+                                    widget.add_diff_output(msg);
+                                }
+                                continue;
+                            }
+                        };
+
+                        if let AppState::Chat { widget } = &mut self.app_state {
+                            let text = if is_git_repo {
+                                diff_text
+                            } else {
+                                "`/diff` — _not inside a git repository_".to_string()
+                            };
+                            widget.add_diff_output(text);
+                        }
+                    }
+                    #[cfg(debug_assertions)]
+                    (SlashCommand::TestApproval, _) => {
+                        use std::collections::HashMap;
+
+                        use codex_core::protocol::ApplyPatchApprovalRequestEvent;
+                        use codex_core::protocol::FileChange;
+
+                        self.app_event_tx.send(AppEvent::CodexEvent(Event {
+                            id: "1".to_string(),
+                            msg: EventMsg::ApplyPatchApprovalRequest(
+                                ApplyPatchApprovalRequestEvent {
+                                    call_id: "1".to_string(),
+                                    changes: HashMap::from([
+                                        (
+                                            PathBuf::from("/tmp/test.txt"),
+                                            FileChange::Add {
+                                                content: "test".to_string(),
+                                            },
+                                        ),
+                                        (
+                                            PathBuf::from("/tmp/test2.txt"),
+                                            FileChange::Update {
+                                                unified_diff: "+test\n-test2".to_string(),
+                                                move_path: None,
+                                            },
+                                        ),
+                                    ]),
+                                    reason: None,
+                                    grant_root: Some(PathBuf::from("/tmp")),
+                                },
+                            ),
+                        }));
+                    }
+                    (SlashCommand::Model, Some(args)) => self.handle_model_command(args),
+                    (SlashCommand::Approvals, Some(args)) => self.handle_approvals_command(args),
+                    // With no args, open the corresponding selector popups.
+                    (SlashCommand::Model, None) => {
+                        self.app_event_tx.send(AppEvent::OpenModelSelector)
+                    }
+                    (SlashCommand::Approvals, None) => {
+                        self.app_event_tx.send(AppEvent::OpenExecutionSelector)
+                    }
+                },
+                AppEvent::StartFileSearch(query) => {
+                    self.file_search.on_user_query(query);
+                }
+                AppEvent::FileSearchResult { query, matches } => {
+                    if let AppState::Chat { widget } = &mut self.app_state {
+                        widget.apply_file_search_result(query, matches);
+                    }
+                }
+            }
+        }
+        terminal.clear()?;
+
+        Ok(())
+    }
+
+    pub(crate) fn token_usage(&self) -> codex_core::protocol::TokenUsage {
+        match &self.app_state {
+            AppState::Chat { widget } => widget.token_usage().clone(),
+            AppState::GitWarning { .. } => codex_core::protocol::TokenUsage::default(),
+            AppState::DangerWarning { widget, .. } => widget.token_usage().clone(),
+        }
+    }
+
+    fn draw_next_frame(&mut self, terminal: &mut tui::Tui) -> Result<()> {
+        let screen_size = terminal.size()?;
+        let last_known_screen_size = terminal.last_known_screen_size;
+        if screen_size != last_known_screen_size {
+            let cursor_pos = terminal.get_cursor_position()?;
+            let last_known_cursor_pos = terminal.last_known_cursor_pos;
+            if cursor_pos.y != last_known_cursor_pos.y {
+                // The terminal was resized. The only point of reference we have for where our viewport
+                // was moved is the cursor position.
+                // NB this assumes that the cursor was not wrapped as part of the resize.
+                let cursor_delta = cursor_pos.y as i32 - last_known_cursor_pos.y as i32;
+
+                let new_viewport_area = terminal.viewport_area.offset(Offset {
+                    x: 0,
+                    y: cursor_delta,
+                });
+                terminal.set_viewport_area(new_viewport_area);
+                terminal.clear()?;
+            }
+        }
+
+        let size = terminal.size()?;
+        let desired_height = match &self.app_state {
+            AppState::Chat { widget } => widget.desired_height(size.width),
+            AppState::GitWarning { .. } => 10,
+            AppState::DangerWarning { .. } => size.height,
+        };
+
+        // After leaving the danger modal, resync cursor and bottom‑anchor the viewport.
+        if self.fixup_viewport_after_danger {
+            self.fixup_viewport_after_danger = false;
+            let pos = terminal.get_cursor_position()?;
+            terminal.last_known_cursor_pos = pos;
+            let old_area = terminal.viewport_area;
+            let mut new_area = old_area;
+            new_area.height = desired_height.min(size.height);
+            new_area.width = size.width;
+            new_area.y = size.height.saturating_sub(new_area.height);
+            if new_area != old_area {
+                terminal.set_viewport_area(new_area);
+            }
+        }
+
+        let mut area = terminal.viewport_area;
+        area.height = desired_height.min(size.height);
+        area.width = size.width;
+        if area.bottom() > size.height {
+            terminal
+                .backend_mut()
+                .scroll_region_up(0..area.top(), area.bottom() - size.height)?;
+            area.y = size.height - area.height;
+        }
+        if area != terminal.viewport_area {
+            terminal.clear()?;
+            terminal.set_viewport_area(area);
+        }
+        if !self.pending_history_lines.is_empty() {
+            crate::insert_history::insert_history_lines(
+                terminal,
+                self.pending_history_lines.clone(),
+            );
+            self.pending_history_lines.clear();
+        }
+        terminal.draw(|frame| match &mut self.app_state {
+            AppState::Chat { widget } => {
+                if let Some((x, y)) = widget.cursor_pos(frame.area()) {
+                    frame.set_cursor_position((x, y));
+                }
+                frame.render_widget_ref(&**widget, frame.area());
+                self.last_bottom_pane_area = Some(area);
+            }
+            AppState::GitWarning { screen } => {
+                frame.render_widget_ref(&*screen, frame.area());
+                self.last_bottom_pane_area = None;
+            }
+            AppState::DangerWarning { screen, .. } => {
+                frame.render_widget_ref(&*screen, frame.area());
+                self.last_bottom_pane_area = None;
+            }
+        })?;
+        Ok(())
+    }
+
+    /// Dispatch a KeyEvent to the current view and let it decide what to do
+    /// with it.
+    fn dispatch_key_event(&mut self, key_event: KeyEvent) {
+        match &mut self.app_state {
+            AppState::Chat { widget } => {
+                widget.handle_key_event(key_event);
+            }
+            AppState::GitWarning { screen } => match screen.handle_key_event(key_event) {
+                GitWarningOutcome::Continue => {
+                    // User accepted – switch to chat view.
+                    let args = match self.chat_args.take() {
+                        Some(args) => args,
+                        None => panic!("ChatWidgetArgs already consumed"),
+                    };
+
+                    let widget = Box::new(ChatWidget::new(
+                        args.config,
+                        self.app_event_tx.clone(),
+                        args.initial_prompt,
+                        args.initial_images,
+                        args.enhanced_keys_supported,
+                        args.cli_flags_used,
+                        args.cli_model,
+                    ));
+                    self.app_state = AppState::Chat { widget };
+                    self.app_event_tx.send(AppEvent::RequestRedraw);
+                }
+                GitWarningOutcome::Quit => {
+                    self.app_event_tx.send(AppEvent::ExitRequest);
+                }
+                GitWarningOutcome::None => {}
+            },
+            AppState::DangerWarning { screen, .. } => match screen.handle_key_event(key_event) {
+                DangerWarningOutcome::Continue => {
+                    let taken = std::mem::replace(
+                        &mut self.app_state,
+                        AppState::GitWarning {
+                            screen: GitWarningScreen::new(),
+                        },
+                    );
+                    let _ = ct_execute!(std::io::stdout(), LeaveAlternateScreen);
+                    self.fixup_viewport_after_danger = true;
+                    if let AppState::DangerWarning {
+                        mut widget,
+                        pending_approval,
+                        pending_sandbox,
+                        ..
+                    } = taken
+                    {
+                        let approval = pending_approval;
+                        let sandbox = pending_sandbox;
+                        widget.update_execution_mode_and_reconfigure(approval, sandbox);
+                        self.app_state = AppState::Chat { widget };
+                        self.app_event_tx.send(AppEvent::RequestRedraw);
+                    }
+                }
+                DangerWarningOutcome::Cancel => {
+                    let taken = std::mem::replace(
+                        &mut self.app_state,
+                        AppState::GitWarning {
+                            screen: GitWarningScreen::new(),
+                        },
+                    );
+                    let _ = ct_execute!(std::io::stdout(), LeaveAlternateScreen);
+                    self.fixup_viewport_after_danger = true;
+                    if let AppState::DangerWarning { widget, .. } = taken {
+                        self.app_state = AppState::Chat { widget };
+                        self.app_event_tx.send(AppEvent::RequestRedraw);
+                    }
+                }
+                DangerWarningOutcome::None => {}
+            },
+        }
+    }
+
+    fn dispatch_paste_event(&mut self, pasted: String) {
+        match &mut self.app_state {
+            AppState::Chat { widget } => widget.handle_paste(pasted),
+            AppState::GitWarning { .. } => {}
+            AppState::DangerWarning { .. } => {}
+        }
+    }
+
+    fn dispatch_codex_event(&mut self, event: Event) {
+        match &mut self.app_state {
+            AppState::Chat { widget } => widget.handle_codex_event(event),
+            AppState::GitWarning { .. } => {}
+            AppState::DangerWarning { widget, .. } => widget.handle_codex_event(event),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::command_utils::strip_surrounding_quotes;
+
+    #[test]
+    fn strip_surrounding_quotes_cases() {
+        let cases = vec![
+            ("o3", "o3"),
+            (" \"codex-mini-latest\" ", "codex-mini-latest"),
+            ("another_model", "another_model"),
+            ("‘quoted’", "quoted"),
+            ("“smart”", "smart"),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(strip_surrounding_quotes(input), expected.to_string());
+        }
+    }
+
+    #[test]
+    fn model_command_args_extraction_and_normalization() {
+        let cases = vec![
+            ("/model", "", ""),
+            ("/model o3", "o3", "o3"),
+            ("/model another_model", "another_model", "another_model"),
+        ];
+        for (line, raw_expected, norm_expected) in cases {
+            let raw = if let Some(stripped) = line.strip_prefix('/') {
+                let token = stripped.trim_start();
+                let cmd_token = token.split_whitespace().next().unwrap_or("");
+                let rest = &token[cmd_token.len()..];
+                rest.trim_start().to_string()
+            } else {
+                String::new()
+            };
+            assert_eq!(raw, raw_expected, "raw args for '{line}'");
+            let normalized = strip_surrounding_quotes(&raw).trim().to_string();
+            assert_eq!(normalized, norm_expected, "normalized args for '{line}'");
+        }
+    }
+}
