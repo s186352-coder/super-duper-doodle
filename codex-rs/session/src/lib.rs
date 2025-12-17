@@ -1,0 +1,20 @@
+//! Library entry-point re-exporting the CLI so the binary can stay tiny.
+
+//! Manage background `codex-exec` agents.
+//!
+//! This library is thin: it only re-exports the clap CLI and helpers so
+//! the binary can stay small and unit tests can call into pure Rust APIs.
+
+pub mod build;
+pub mod cli;
+pub mod meta;
+mod sig;
+mod spawn;
+pub mod store;
+
+pub use cli::Cli;
+
+/// Entry used by the bin crate.
+pub async fn run_main(cli: Cli) -> anyhow::Result<()> {
+    cli.dispatch().await
+}
