@@ -1,0 +1,69 @@
+use std::collections::HashMap;
+use std::path::PathBuf;
+
+use codex_core::config::Config;
+use codex_core::protocol::Event;
+use codex_core::protocol::EventMsg;
+use codex_core::protocol::TaskCompleteEvent;
+use serde_json::json;
+
+use crate::event_processor::CodexStatus;
+use crate::event_processor::EventProcessor;
+use crate::event_processor::PromptOrigin;
+use crate::event_processor::create_config_summary_entries;
+use crate::event_processor::handle_last_message;
+
+pub(crate) struct EventProcessorWithJsonOutput {
+    last_message_path: Option<PathBuf>,
+    prompt_origin: Option<PromptOrigin>,
+}
+
+impl EventProcessorWithJsonOutput {
+    pub fn new(last_message_path: Option<PathBuf>, prompt_origin: Option<PromptOrigin>) -> Self {
+        Self {
+            last_message_path,
+            prompt_origin,
+        }
+    }
+}
+
+impl EventProcessor for EventProcessorWithJsonOutput {
+    fn print_config_summary(&mut self, config: &Config, prompt: &str) {
+        let entries = create_config_summary_entries(config, self.prompt_origin.as_ref())
+            .into_iter()
+            .map(|(key, value)| (key.to_string(), value))
+            .collect::<HashMap<String, String>>();
+        #[allow(clippy::expect_used)]
+        let config_json =
+            serde_json::to_string(&entries).expect("Failed to serialize config summary to JSON");
+        println!("{config_json}");
+
+        let prompt_json = json!({
+            "prompt": prompt,
+        });
+        println!("{prompt_json}");
+    }
+
+    fn process_event(&mut self, event: Event) -> CodexStatus {
+        match event.msg {
+            EventMsg::AgentMessageDelta(_) | EventMsg::AgentReasoningDelta(_) => {
+                // Suppress streaming events in JSON mode.
+                CodexStatus::Running
+            }
+            EventMsg::TaskComplete(TaskCompleteEvent { last_agent_message }) => {
+                handle_last_message(
+                    last_agent_message.as_deref(),
+                    self.last_message_path.as_deref(),
+                );
+                CodexStatus::InitiateShutdown
+            }
+            EventMsg::ShutdownComplete => CodexStatus::Shutdown,
+            _ => {
+                if let Ok(line) = serde_json::to_string(&event) {
+                    println!("{line}");
+                }
+                CodexStatus::Running
+            }
+        }
+    }
+}
